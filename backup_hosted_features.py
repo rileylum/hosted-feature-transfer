@@ -28,7 +28,7 @@ import shutil
 import logging
 import zipfile
 from pathlib import Path
-from datetime import datetime
+import datetime
 
 from arcgis.gis import GIS
 import arcpy
@@ -81,7 +81,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 def sanitize_name(name: str) -> str:
