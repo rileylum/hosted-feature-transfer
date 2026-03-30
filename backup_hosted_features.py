@@ -144,26 +144,29 @@ def export_and_download(item, dest_dir: Path) -> Path:
     zip_path = dest_dir / f"{sanitize_name(item.title)}.gdb.zip"
 
     log.info("  Exporting '%s' → FGDB …", item.title)
-    exported = item.export(
+    result = item.export(
         title=export_title,
         export_format="File Geodatabase",
         wait=False,
     )
 
-    # Poll until the export finishes (avoids holding one long HTTP connection).
+    # wait=False returns a dict with jobId and exportItemId.
+    job_id = result.get("jobId")
+    export_item_id = result.get("exportItemId")
+
+    # Poll the source item's status until the export job completes.
     elapsed = 0
     while True:
-        try:
-            status = exported.status()
-        except Exception:
-            status = None
+        status = item.status(job_type="export", job_id=job_id)
+        log.debug("  Export status: %s", status)
 
-        if status and status.get("status") == "completed":
+        if status.get("status") == "completed":
             break
 
-        if status and status.get("status") == "failed":
+        if status.get("status") == "failed":
             raise RuntimeError(
-                f"Export failed for '{item.title}': {status.get('statusMessage')}"
+                f"Export failed for '{item.title}': "
+                f"{status.get('statusMessage')}"
             )
 
         if elapsed >= EXPORT_TIMEOUT:
@@ -175,6 +178,9 @@ def export_and_download(item, dest_dir: Path) -> Path:
         elapsed += EXPORT_POLL_INTERVAL
         if elapsed % 30 == 0:
             log.info("  Still exporting … (%ds elapsed)", elapsed)
+
+    # Retrieve the exported item for download.
+    exported = item._gis.content.get(export_item_id)
 
     log.info("  Downloading to %s …", zip_path)
     exported.download(save_path=str(dest_dir), file_name=zip_path.name)
