@@ -25,6 +25,7 @@ import json
 import sys
 import shutil
 import logging
+import time
 import zipfile
 import tempfile
 from pathlib import Path
@@ -41,6 +42,10 @@ USERNAME = None
 PASSWORD = None
 
 LOG_LEVEL = logging.INFO
+
+# Publish polling settings.
+PUBLISH_POLL_INTERVAL = 5   # seconds between status checks
+PUBLISH_TIMEOUT = 600       # max seconds to wait for publish
 
 # How many web map / app items to fetch per search page.
 PAGE_SIZE = 100
@@ -163,7 +168,39 @@ def publish_service(gis: GIS, meta: dict, gdb_zip: Path) -> "Item":
     uploaded = gis.content.add(item_properties, data=str(gdb_zip))
     log.info("  Uploaded as item %s — publishing …", uploaded.id)
 
-    published = uploaded.publish(publish_parameters=pub_params)
+    # Publish asynchronously to avoid token expiry on long operations.
+    result = uploaded.publish(publish_parameters=pub_params, wait=False)
+
+    # result is a dict when wait=False; poll the source item for status.
+    job_id = result.get("jobId")
+    service_item_id = result.get("serviceItemId")
+
+    elapsed = 0
+    while True:
+        status = uploaded.status(job_type="publish", job_id=job_id)
+        log.debug("  Publish status: %s", status)
+
+        if status.get("status") == "completed":
+            break
+
+        if status.get("status") == "failed":
+            raise RuntimeError(
+                f"Publish failed: {status.get('statusMessage')}"
+            )
+
+        if elapsed >= PUBLISH_TIMEOUT:
+            raise RuntimeError(
+                f"Publish timed out after {PUBLISH_TIMEOUT}s"
+            )
+
+        time.sleep(PUBLISH_POLL_INTERVAL)
+        elapsed += PUBLISH_POLL_INTERVAL
+        if elapsed % 30 == 0:
+            log.info("  Still publishing … (%ds elapsed)", elapsed)
+
+    # Re-authenticate and fetch the published service item.
+    gis = connect()
+    published = gis.content.get(service_item_id)
     log.info("  Published: '%s' (%s)", published.title, published.id)
     log.info("  New URL: %s", published.url)
 
