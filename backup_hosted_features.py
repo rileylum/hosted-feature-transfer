@@ -26,6 +26,7 @@ import json
 import sys
 import shutil
 import logging
+import time
 import zipfile
 from pathlib import Path
 import datetime
@@ -66,6 +67,7 @@ EXPORT_POLL_INTERVAL = 5
 
 # Maximum time (seconds) to wait for an export to finish.
 EXPORT_TIMEOUT = 600
+
 
 # Log level
 LOG_LEVEL = logging.INFO
@@ -139,15 +141,41 @@ def export_and_download(item, dest_dir: Path) -> Path:
     Returns the path to the extracted .gdb folder.
     """
     export_title = f"{item.title}_backup_{timestamp}"
-    log.info("  Exporting '%s' → FGDB …", item.title)
+    zip_path = dest_dir / f"{sanitize_name(item.title)}.gdb.zip"
 
+    log.info("  Exporting '%s' → FGDB …", item.title)
     exported = item.export(
         title=export_title,
         export_format="File Geodatabase",
-        wait=True,
+        wait=False,
     )
 
-    zip_path = dest_dir / f"{sanitize_name(item.title)}.gdb.zip"
+    # Poll until the export finishes (avoids holding one long HTTP connection).
+    elapsed = 0
+    while True:
+        try:
+            status = exported.status()
+        except Exception:
+            status = None
+
+        if status and status.get("status") == "completed":
+            break
+
+        if status and status.get("status") == "failed":
+            raise RuntimeError(
+                f"Export failed for '{item.title}': {status.get('statusMessage')}"
+            )
+
+        if elapsed >= EXPORT_TIMEOUT:
+            raise RuntimeError(
+                f"Export timed out after {EXPORT_TIMEOUT}s for '{item.title}'"
+            )
+
+        time.sleep(EXPORT_POLL_INTERVAL)
+        elapsed += EXPORT_POLL_INTERVAL
+        if elapsed % 30 == 0:
+            log.info("  Still exporting … (%ds elapsed)", elapsed)
+
     log.info("  Downloading to %s …", zip_path)
     exported.download(save_path=str(dest_dir), file_name=zip_path.name)
 
