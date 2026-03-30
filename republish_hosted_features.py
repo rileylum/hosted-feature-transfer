@@ -168,39 +168,27 @@ def publish_service(gis: GIS, meta: dict, gdb_zip: Path) -> "Item":
     uploaded = gis.content.add(item_properties, data=str(gdb_zip))
     log.info("  Uploaded as item %s — publishing …", uploaded.id)
 
-    # Publish asynchronously to avoid token expiry on long operations.
-    result = uploaded.publish(publish_parameters=pub_params, wait=False)
+    # publish() uses 'future' param (not 'wait'). Use future=True to avoid
+    # blocking on one long HTTP connection that can lose its token.
+    publish_future = uploaded.publish(publish_parameters=pub_params, future=True)
 
-    # result is a dict when wait=False; poll the source item for status.
-    job_id = result.get("jobId")
-    service_item_id = result.get("serviceItemId")
-
+    # Poll the Future until the publish completes.
     elapsed = 0
-    while True:
-        status = uploaded.status(job_type="publish", job_id=job_id)
-        log.debug("  Publish status: %s", status)
-
-        if status.get("status") == "completed":
-            break
-
-        if status.get("status") == "failed":
-            raise RuntimeError(
-                f"Publish failed: {status.get('statusMessage')}"
-            )
-
+    while not publish_future.done():
         if elapsed >= PUBLISH_TIMEOUT:
             raise RuntimeError(
                 f"Publish timed out after {PUBLISH_TIMEOUT}s"
             )
-
         time.sleep(PUBLISH_POLL_INTERVAL)
         elapsed += PUBLISH_POLL_INTERVAL
         if elapsed % 30 == 0:
             log.info("  Still publishing … (%ds elapsed)", elapsed)
 
-    # Re-authenticate and fetch the published service item.
+    published = publish_future.result()
+
+    # Re-authenticate to ensure fresh token for subsequent operations.
     gis = connect()
-    published = gis.content.get(service_item_id)
+    published = gis.content.get(published.id)
     log.info("  Published: '%s' (%s)", published.title, published.id)
     log.info("  New URL: %s", published.url)
 
