@@ -179,8 +179,9 @@ def export_and_download(item, dest_dir: Path) -> Path:
         if elapsed % 30 == 0:
             log.info("  Still exporting … (%ds elapsed)", elapsed)
 
-    # Retrieve the exported item for download.
-    exported = item._gis.content.get(export_item_id)
+    # Re-authenticate to get a fresh token before downloading.
+    gis = connect()
+    exported = gis.content.get(export_item_id)
 
     log.info("  Downloading to %s …", zip_path)
     exported.download(save_path=str(dest_dir), file_name=zip_path.name)
@@ -429,6 +430,10 @@ def main():
 
     succeeded, failed = 0, 0
     for i, item in enumerate(items, 1):
+        # Re-authenticate before each item to avoid token expiry on long runs.
+        gis = connect()
+        item = gis.content.get(item.id)
+
         log.info("[%d/%d] %s  (id: %s, owner: %s)",
                  i, len(items), item.title, item.id, item.owner)
         if backup_item(item, root):
