@@ -2,9 +2,11 @@
 Backup all Hosted Feature Services from ArcGIS Online / Portal.
 
 For each hosted feature service this script:
-  1. Exports it to a File Geodatabase (FGDB).
-  2. Downloads and extracts the FGDB locally.
-  3. Creates an ArcGIS Pro project (.aprx) with map layers pointing at the
+  1. Saves portal item metadata (properties, sharing, layer definitions)
+     to metadata.json so the service can be republished fresh.
+  2. Exports it to a File Geodatabase (FGDB).
+  3. Downloads and extracts the FGDB locally.
+  4. Creates an ArcGIS Pro project (.aprx) with map layers pointing at the
      local FGDB, so the service can be republished if the hosted datastore
      is ever lost or corrupted.
 
@@ -20,12 +22,11 @@ Usage:
 """
 
 import argparse
-import os
+import json
 import sys
 import shutil
 import logging
 import zipfile
-import time
 from pathlib import Path
 from datetime import datetime
 
@@ -225,6 +226,98 @@ def create_aprx(item, gdb_path: Path, dest_dir: Path) -> Path:
     return aprx_path
 
 
+def _serialize_layer(layer) -> dict:
+    """Extract the properties we need from a single layer or table."""
+    props = layer.properties
+    info = {
+        "id": props.get("id"),
+        "name": props.get("name"),
+        "fields": props.get("fields"),
+        "maxRecordCount": props.get("maxRecordCount"),
+        "capabilities": props.get("capabilities"),
+        "hasAttachments": props.get("hasAttachments", False),
+        "editingInfo": props.get("editingInfo"),
+        "globalIdField": props.get("globalIdField"),
+        "editFieldsInfo": props.get("editFieldsInfo"),
+    }
+    # Spatial layers have geometry + renderer; tables do not.
+    if props.get("geometryType"):
+        info["geometryType"] = props["geometryType"]
+        info["drawingInfo"] = props.get("drawingInfo")
+    return info
+
+
+def save_item_metadata(item, dest_dir: Path) -> Path:
+    """
+    Write a metadata.json capturing all portal item properties needed to
+    republish this service in a new environment.
+    """
+    log.info("  Saving portal metadata …")
+
+    # --- Item-level properties ---
+    item_info = {
+        "id": item.id,
+        "title": item.title,
+        "snippet": item.snippet,
+        "description": item.description,
+        "tags": item.tags,
+        "typeKeywords": item.typeKeywords,
+        "accessInformation": item.accessInformation,
+        "licenseInfo": item.licenseInfo,
+        "extent": item.extent,
+        "spatialReference": getattr(item, "spatialReference", None),
+        "owner": item.owner,
+        "access": item.access,
+        "url": item.url,
+    }
+
+    # --- Sharing ---
+    shared = item.shared_with
+    sharing_info = {
+        "access": item.access,
+        "everyone": shared.get("everyone", False),
+        "org": shared.get("org", False),
+        "groups": [
+            {"id": g.id, "title": g.title}
+            for g in shared.get("groups", [])
+        ],
+    }
+
+    # --- Layers & tables ---
+    layers = [_serialize_layer(lyr) for lyr in getattr(item, "layers", []) or []]
+    tables = [_serialize_layer(tbl) for tbl in getattr(item, "tables", []) or []]
+
+    # --- Convenience publish_parameters ---
+    max_rc = layers[0].get("maxRecordCount", 2000) if layers else 2000
+    publish_params = {
+        "name": sanitize_name(item.title),
+        "maxRecordCount": max_rc,
+    }
+
+    metadata = {
+        "item": item_info,
+        "sharing": sharing_info,
+        "layers": layers,
+        "tables": tables,
+        "publish_parameters": publish_params,
+        "backup_timestamp": timestamp,
+    }
+
+    meta_path = dest_dir / "metadata.json"
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2, ensure_ascii=False, default=str)
+    log.info("  Metadata written: %s", meta_path)
+
+    # --- Thumbnail ---
+    try:
+        item.download_thumbnail(save_folder=str(dest_dir))
+        log.info("  Thumbnail saved")
+    except Exception:
+        log.debug("  No thumbnail available or download failed")
+
+    return meta_path
+
+
 def backup_item(item, root: Path) -> bool:
     """Run the full backup pipeline for a single hosted feature service."""
     safe_name = sanitize_name(item.title)
@@ -232,6 +325,7 @@ def backup_item(item, root: Path) -> bool:
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     try:
+        save_item_metadata(item, dest_dir)
         gdb_path = export_and_download(item, dest_dir)
         create_aprx(item, gdb_path, dest_dir)
         return True
