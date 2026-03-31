@@ -131,20 +131,85 @@ def zip_gdb(gdb_path: Path) -> Path:
 # Delete existing service
 # ---------------------------------------------------------------------------
 
-def delete_existing(gis: GIS, old_id: str) -> bool:
-    """Delete the old service if it still exists. Returns True if deleted."""
+def delete_existing(gis: GIS, old_id: str, service_name: str = None) -> bool:
+    """
+    Delete the old service if it still exists, by item ID, portal search,
+    and ArcGIS Server service directory.
+
+    A previous failed publish can leave behind a registered service in
+    ArcGIS Server even when there's no portal item. This checks all three
+    locations.
+    """
+    deleted = False
+
+    # 1. Try by item ID.
     try:
         item = gis.content.get(old_id)
     except Exception:
         item = None
 
-    if item is None:
-        log.info("  Old item %s not found — nothing to delete", old_id)
+    if item is not None:
+        log.info("  Deleting old item '%s' (%s) …", item.title, old_id)
+        item.delete(force=True)
+        deleted = True
+
+    # 2. Search portal for any existing service with the same name.
+    if service_name:
+        query = (
+            f'type:"Feature Service" typekeywords:"Hosted Service"'
+            f' title:"{service_name}"'
+        )
+        matches = gis.content.search(query=query, max_items=10)
+        for match in matches:
+            if match.title == service_name and match.id != old_id:
+                log.info("  Deleting orphan portal item '%s' (%s) …",
+                         match.title, match.id)
+                match.delete(force=True)
+                deleted = True
+
+    # 3. Check ArcGIS Server directly for orphan services with no portal item.
+    if service_name:
+        deleted = _delete_server_orphan(gis, service_name) or deleted
+
+    if not deleted:
+        log.info("  No existing items or services found to delete")
+
+    return deleted
+
+
+def _delete_server_orphan(gis: GIS, service_name: str) -> bool:
+    """Check the Hosted folder on federated servers for an orphan service."""
+    deleted = False
+    try:
+        servers = gis.admin.servers.list()
+    except Exception:
+        log.debug("  Could not list federated servers (may need admin role)")
         return False
 
-    log.info("  Deleting old item '%s' (%s) …", item.title, old_id)
-    item.delete(force=True)
-    return True
+    for server in servers:
+        try:
+            if server.services.exists(
+                folder_name="Hosted",
+                name=service_name,
+                service_type="FeatureServer",
+            ):
+                log.info("  Found orphan service '%s' on server — deleting …",
+                         service_name)
+                hosted = server.services.list(folder="Hosted")
+                for svc in hosted:
+                    svc_name = getattr(svc.properties, "serviceName",
+                                       getattr(svc.properties, "name", ""))
+                    if svc_name == service_name:
+                        svc.delete()
+                        log.info("  Deleted orphan server service '%s'",
+                                 service_name)
+                        deleted = True
+                        break
+        except Exception:
+            log.warning("  Error checking server for orphan service '%s'",
+                        service_name, exc_info=True)
+
+    return deleted
 
 
 # ---------------------------------------------------------------------------
@@ -156,8 +221,10 @@ def publish_service(gis: GIS, meta: dict, gdb_zip: Path) -> "Item":
     item_meta = meta["item"]
     pub_params = meta["publish_parameters"]
 
+    # Use a distinct title for the uploaded FGDB so it doesn't clash with
+    # the service name that ArcGIS will create during publish.
     item_properties = {
-        "title": item_meta["title"],
+        "title": item_meta["title"] + " (source FGDB)",
         "tags": ",".join(item_meta.get("tags") or []),
         "snippet": item_meta.get("snippet") or "",
         "description": item_meta.get("description") or "",
@@ -398,7 +465,8 @@ def republish_one(gis: GIS, backup_dir: Path, dry_run: bool = False):
         return None
 
     try:
-        delete_existing(gis, old_id)
+        service_name = meta["publish_parameters"].get("name") or title
+        delete_existing(gis, old_id, service_name)
 
         gdb_zip = zip_gdb(gdb_path)
         try:
