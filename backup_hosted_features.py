@@ -110,22 +110,12 @@ def search_hosted_feature_services(gis: GIS) -> list:
     if OWNER_FILTER:
         query += f" owner:{OWNER_FILTER}"
 
-    items = []
-    start = 1
-    while True:
-        batch = gis.content.search(
-            query=query,
-            max_items=PAGE_SIZE,
-            start=start,
-            sort_field="title",
-            sort_order="asc",
-        )
-        if not batch:
-            break
-        items.extend(batch)
-        if len(batch) < PAGE_SIZE:
-            break
-        start += PAGE_SIZE
+    items = gis.content.search(
+        query=query,
+        max_items=10000,
+        sort_field="title",
+        sort_order="asc",
+    )
 
     if FOLDER_FILTER:
         items = [i for i in items if getattr(i, "ownerFolder", None) == FOLDER_FILTER]

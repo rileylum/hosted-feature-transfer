@@ -2,17 +2,20 @@
 Republish Hosted Feature Services from local backups.
 
 Reads backup folders produced by backup_hosted_features.py and for each:
-  1. Deletes the old broken service if it still exists in the portal.
-  2. Zips and uploads the local File Geodatabase.
-  3. Publishes a new hosted feature service.
-  4. Restores item metadata (title, tags, description, thumbnail, etc.).
-  5. Restores layer definitions (renderer, edit tracking, capabilities).
-  6. Reassigns ownership if the original owner differs from the current user.
-  7. Restores sharing settings (org, everyone, groups).
+  1. Tries to overwrite the existing service from the .aprx (preserves
+     the original item ID and URL so web maps/apps keep working).
+  2. If overwrite fails, falls back to delete and recreate:
+     a. Deletes the old broken service from portal and ArcGIS Server.
+     b. Zips and uploads the local File Geodatabase.
+     c. Publishes a new hosted feature service.
+     d. Restores item metadata (title, tags, description, thumbnail, etc.).
+     e. Restores layer definitions (renderer, edit tracking, capabilities).
+     f. Reassigns ownership if the original owner differs from the current user.
+     g. Restores sharing settings (org, everyone, groups).
 
 After all services are republished, scans Web Maps and Web Mapping
 Applications for references to old service URLs and remaps them to the
-new URLs.
+new URLs (only needed for services that were recreated, not overwritten).
 
 Usage:
   python republish_hosted_features.py <backup_dir>
@@ -32,6 +35,7 @@ from pathlib import Path
 import datetime
 
 from arcgis.gis import GIS
+import arcpy
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -84,9 +88,9 @@ def connect() -> GIS:
 
 def load_backup(backup_dir: Path) -> dict:
     """
-    Read metadata.json and locate the .gdb in a backup subfolder.
+    Read metadata.json and locate the .gdb and .aprx in a backup subfolder.
 
-    Returns dict with keys: 'metadata', 'gdb_path', 'thumbnail_path'.
+    Returns dict with keys: 'metadata', 'gdb_path', 'aprx_path', 'thumbnail_path'.
     """
     meta_path = backup_dir / "metadata.json"
     if not meta_path.exists():
@@ -101,6 +105,10 @@ def load_backup(backup_dir: Path) -> dict:
         raise FileNotFoundError(f"No .gdb folder in {backup_dir}")
     gdb_path = gdbs[0]
 
+    # Find the .aprx project.
+    aprxs = list(backup_dir.glob("*.aprx"))
+    aprx_path = aprxs[0] if aprxs else None
+
     # Optional thumbnail.
     thumbnails = list(backup_dir.glob("thumbnail.*"))
     thumbnail_path = thumbnails[0] if thumbnails else None
@@ -108,6 +116,7 @@ def load_backup(backup_dir: Path) -> dict:
     return {
         "metadata": metadata,
         "gdb_path": gdb_path,
+        "aprx_path": aprx_path,
         "thumbnail_path": thumbnail_path,
     }
 
@@ -434,6 +443,72 @@ def restore_sharing(published, meta: dict):
 
 
 # ---------------------------------------------------------------------------
+# Overwrite publish from .aprx
+# ---------------------------------------------------------------------------
+
+def try_overwrite_publish(gis: GIS, aprx_path: Path, meta: dict) -> bool:
+    """
+    Attempt to overwrite the existing hosted feature service from the .aprx.
+
+    Returns True if the overwrite succeeded, False otherwise.
+    This preserves the original item ID and URL.
+    """
+    service_name = meta["publish_parameters"].get("name")
+    if not service_name:
+        log.info("  No service name in metadata — skipping overwrite attempt")
+        return False
+
+    if not aprx_path or not aprx_path.exists():
+        log.info("  No .aprx found — skipping overwrite attempt")
+        return False
+
+    log.info("  Attempting overwrite publish from %s …", aprx_path.name)
+
+    sddraft_path = str(aprx_path.parent / f"{service_name}.sddraft")
+    sd_path = str(aprx_path.parent / f"{service_name}.sd")
+
+    try:
+        aprx = arcpy.mp.ArcGISProject(str(aprx_path))
+        mp = aprx.listMaps()[0]
+
+        sddraft = mp.getWebLayerSharingDraft(
+            "HOSTING_SERVER", "FEATURE", service_name
+        )
+        sddraft.overwriteExistingService = True
+
+        # Apply metadata from the backup.
+        item_meta = meta.get("item", {})
+        if item_meta.get("snippet"):
+            sddraft.summary = item_meta["snippet"]
+        if item_meta.get("tags"):
+            sddraft.tags = ",".join(item_meta["tags"])
+        if item_meta.get("description"):
+            sddraft.description = item_meta["description"]
+        if item_meta.get("accessInformation"):
+            sddraft.credits = item_meta["accessInformation"]
+
+        sddraft.exportToSDDraft(sddraft_path)
+        arcpy.server.StageService(sddraft_path, sd_path)
+        arcpy.server.UploadServiceDefinition(sd_path, "HOSTING_SERVER")
+
+        log.info("  Overwrite publish succeeded for '%s'", service_name)
+        del aprx
+        return True
+
+    except Exception:
+        log.warning("  Overwrite publish failed — will fall back to "
+                    "delete and recreate", exc_info=True)
+        return False
+
+    finally:
+        # Clean up staging files.
+        for f in (sddraft_path, sd_path):
+            p = Path(f)
+            if p.exists():
+                p.unlink()
+
+
+# ---------------------------------------------------------------------------
 # Republish one service
 # ---------------------------------------------------------------------------
 
@@ -446,6 +521,7 @@ def republish_one(gis: GIS, backup_dir: Path, dry_run: bool = False):
     backup = load_backup(backup_dir)
     meta = backup["metadata"]
     gdb_path = backup["gdb_path"]
+    aprx_path = backup["aprx_path"]
     thumbnail_path = backup["thumbnail_path"]
 
     old_url = meta["item"].get("url", "")
@@ -458,13 +534,21 @@ def republish_one(gis: GIS, backup_dir: Path, dry_run: bool = False):
             existing = gis.content.get(old_id)
         except Exception:
             pass
-        log.info("  [DRY RUN] Would %s old item %s",
+        log.info("  [DRY RUN] Would try overwrite publish from .aprx first")
+        log.info("  [DRY RUN] Would %s old item %s if overwrite fails",
                  "delete" if existing else "skip (not found)", old_id)
         log.info("  [DRY RUN] Would publish '%s' from %s", title, gdb_path.name)
         log.info("  [DRY RUN] Old URL: %s", old_url)
         return None
 
     try:
+        # Step 1: Try overwrite publish from .aprx — preserves item ID and URL.
+        if try_overwrite_publish(gis, aprx_path, meta):
+            log.info("  Done (overwrite): URL unchanged %s", old_url)
+            return (old_url, old_url)  # URL didn't change
+
+        # Step 2: Fall back to delete and recreate from FGDB.
+        log.info("  Falling back to delete and recreate …")
         service_name = meta["publish_parameters"].get("name") or title
         delete_existing(gis, old_id, service_name)
 
@@ -483,7 +567,7 @@ def republish_one(gis: GIS, backup_dir: Path, dry_run: bool = False):
         restore_sharing(published, meta)
 
         new_url = published.url
-        log.info("  Done: %s → %s", old_url, new_url)
+        log.info("  Done (recreated): %s → %s", old_url, new_url)
         return (old_url, new_url)
 
     except Exception:
@@ -496,20 +580,11 @@ def republish_one(gis: GIS, backup_dir: Path, dry_run: bool = False):
 # ---------------------------------------------------------------------------
 
 def _search_all(gis: GIS, query: str) -> list:
-    """Paginated search returning all matching items."""
-    items = []
-    start = 1
-    while True:
-        batch = gis.content.search(
-            query=query, max_items=PAGE_SIZE, start=start,
-            sort_field="title", sort_order="asc",
-        )
-        if not batch:
-            break
-        items.extend(batch)
-        if len(batch) < PAGE_SIZE:
-            break
-        start += PAGE_SIZE
+    """Search returning all matching items (compatible with arcgis 1.x)."""
+    items = gis.content.search(
+        query=query, max_items=10000,
+        sort_field="title", sort_order="asc",
+    )
     return items
 
 
@@ -555,10 +630,11 @@ def update_web_maps_and_apps(gis: GIS, url_map: dict, dry_run: bool = False):
                      item.title, item.id, matched)
             continue
 
-        updated_data = json.loads(data_str)
         log.info("  Updating '%s' (%s, type=%s) …", item.title, item.id, item.type)
         try:
-            item.update(data=updated_data)
+            # In arcgis 1.x, JSON data must be passed via the 'text' key
+            # in item_properties, not as a 'data' kwarg.
+            item.update(item_properties={"text": data_str})
             updated_count += 1
         except Exception:
             log.warning("  Could not update '%s'", item.title, exc_info=True)
