@@ -181,18 +181,26 @@ def publish_service(gis: GIS, meta: dict, gdb_zip: Path) -> "Item":
         "f": "json",
     }
     resp = gis._con.post(publish_url, publish_params)
+    log.info("  Publish response: %s", resp)
+
+    # Check for top-level error.
+    if resp.get("error"):
+        raise RuntimeError(f"Publish request failed: {resp['error']}")
+
     services = resp.get("services", [])
     if not services:
         raise RuntimeError(f"Publish request returned no services: {resp}")
 
-    job_id = services[0].get("jobId")
-    service_item_id = services[0].get("serviceItemId")
-    log.info("  Publish job started (jobId: %s)", job_id)
+    service_info = services[0]
+    job_id = service_info.get("jobId")
+    service_item_id = service_info.get("serviceItemId")
+    log.info("  Publish job started (jobId: %s, serviceItemId: %s)",
+             job_id, service_item_id)
 
-    # Poll the status endpoint until the publish completes.
+    # Poll the status endpoint on the service item until complete.
     status_url = (
         f"{gis.url}/sharing/rest/content/users/{user}"
-        f"/items/{uploaded.id}/status"
+        f"/items/{service_item_id}/status"
     )
     elapsed = 0
     while True:
@@ -202,7 +210,7 @@ def publish_service(gis: GIS, meta: dict, gdb_zip: Path) -> "Item":
             "f": "json",
         })
         status = status_resp.get("status")
-        log.debug("  Publish status: %s", status_resp)
+        log.info("  Publish status: %s", status_resp)
 
         if status == "completed":
             break
