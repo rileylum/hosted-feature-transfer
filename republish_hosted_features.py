@@ -168,27 +168,63 @@ def publish_service(gis: GIS, meta: dict, gdb_zip: Path) -> "Item":
     uploaded = gis.content.add(item_properties, data=str(gdb_zip))
     log.info("  Uploaded as item %s — publishing …", uploaded.id)
 
-    # publish() uses 'future' param (not 'wait'). Use future=True to avoid
-    # blocking on one long HTTP connection that can lose its token.
-    publish_future = uploaded.publish(publish_parameters=pub_params, future=True)
+    # Call the REST API publish endpoint directly so we can poll for
+    # completion without holding a long HTTP connection. This works across
+    # all arcgis API versions (the Python publish() method's async support
+    # varies by version and has known bugs).
+    user = gis.properties.user.username
+    publish_url = f"{gis.url}/sharing/rest/content/users/{user}/publish"
+    publish_params = {
+        "itemId": uploaded.id,
+        "fileType": "fileGeodatabase",
+        "publishParameters": json.dumps(pub_params),
+        "f": "json",
+    }
+    resp = gis._con.post(publish_url, publish_params)
+    services = resp.get("services", [])
+    if not services:
+        raise RuntimeError(f"Publish request returned no services: {resp}")
 
-    # Poll the Future until the publish completes.
+    job_id = services[0].get("jobId")
+    service_item_id = services[0].get("serviceItemId")
+    log.info("  Publish job started (jobId: %s)", job_id)
+
+    # Poll the status endpoint until the publish completes.
+    status_url = (
+        f"{gis.url}/sharing/rest/content/users/{user}"
+        f"/items/{uploaded.id}/status"
+    )
     elapsed = 0
-    while not publish_future.done():
+    while True:
+        status_resp = gis._con.get(status_url, {
+            "jobType": "publish",
+            "jobId": job_id,
+            "f": "json",
+        })
+        status = status_resp.get("status")
+        log.debug("  Publish status: %s", status_resp)
+
+        if status == "completed":
+            break
+
+        if status == "failed":
+            raise RuntimeError(
+                f"Publish failed: {status_resp.get('statusMessage')}"
+            )
+
         if elapsed >= PUBLISH_TIMEOUT:
             raise RuntimeError(
                 f"Publish timed out after {PUBLISH_TIMEOUT}s"
             )
+
         time.sleep(PUBLISH_POLL_INTERVAL)
         elapsed += PUBLISH_POLL_INTERVAL
         if elapsed % 30 == 0:
             log.info("  Still publishing … (%ds elapsed)", elapsed)
 
-    published = publish_future.result()
-
-    # Re-authenticate to ensure fresh token for subsequent operations.
+    # Re-authenticate and fetch the published service item.
     gis = connect()
-    published = gis.content.get(published.id)
+    published = gis.content.get(service_item_id)
     log.info("  Published: '%s' (%s)", published.title, published.id)
     log.info("  New URL: %s", published.url)
 
