@@ -462,10 +462,25 @@ def try_overwrite_publish(gis: GIS, aprx_path: Path, meta: dict) -> bool:
         log.info("  No .aprx found — skipping overwrite attempt")
         return False
 
+    # Only attempt overwrite if the service actually exists in the portal.
+    old_id = meta["item"].get("id", "")
+    service_exists = False
+    try:
+        existing = gis.content.get(old_id)
+        if existing is not None:
+            service_exists = True
+    except Exception:
+        pass
+
+    if not service_exists:
+        log.info("  Service does not exist in portal — skipping overwrite attempt")
+        return False
+
     log.info("  Attempting overwrite publish from %s …", aprx_path.name)
 
     sddraft_path = str(aprx_path.parent / f"{service_name}.sddraft")
     sd_path = str(aprx_path.parent / f"{service_name}.sd")
+    aprx = None
 
     try:
         aprx = arcpy.mp.ArcGISProject(str(aprx_path))
@@ -488,11 +503,16 @@ def try_overwrite_publish(gis: GIS, aprx_path: Path, meta: dict) -> bool:
             sddraft.credits = item_meta["accessInformation"]
 
         sddraft.exportToSDDraft(sddraft_path)
+
+        # Release the aprx lock before staging so the GDB is not locked
+        # if we need to fall back to the FGDB publish path.
+        del aprx
+        aprx = None
+
         arcpy.server.StageService(sddraft_path, sd_path)
         arcpy.server.UploadServiceDefinition(sd_path, "HOSTING_SERVER")
 
         log.info("  Overwrite publish succeeded for '%s'", service_name)
-        del aprx
         return True
 
     except Exception:
@@ -501,6 +521,9 @@ def try_overwrite_publish(gis: GIS, aprx_path: Path, meta: dict) -> bool:
         return False
 
     finally:
+        # Release aprx lock if still held.
+        if aprx is not None:
+            del aprx
         # Clean up staging files.
         for f in (sddraft_path, sd_path):
             p = Path(f)
